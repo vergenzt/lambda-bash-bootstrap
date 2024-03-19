@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# AWS Lambda custom runtime bootstrap file
+# https://docs.aws.amazon.com/lambda/latest/dg/runtimes-walkthrough.html
+# https://docs.aws.amazon.com/lambda/latest/dg/configuration-envvars.html#configuration-envvars-runtime
+# https://docs.aws.amazon.com/apigateway/latest/developerguide/http-api-develop-integrations-lambda.html
+
+cd "$LAMBDA_TASK_ROOT"
+
+curl=(curl
+  --silent
+  --show-error
+  --location
+  --fail-with-body
+  --variable "LAMBDA=http://${AWS_LAMBDA_RUNTIME_API}/2018-06-01/runtime/invocation"
+)
+
+# Lambda "handler" must be script path relative to directory of `bootstrap`.
+# Handler script must include function with name == basename of script file.
+SCRIPT_PATH=$_HANDLER
+SCRIPT_FN=$(basename "$SCRIPT_PATH" .sh)
+
+# shellcheck disable=SC1090
+source "$(dirname "$0")/$SCRIPT_PATH"
+
+# catch and log errors
+bootstrap_catch() {
+  export retcode=$1
+  export lineno=$2
+  "${curl[@]}" \
+    --expand-url "{{LAMBDA}}/$REQUEST_ID/error" \
+    --variable "message@$STDOUT_AND_STDERR_LOG" \
+    --variable "script=$SCRIPT_PATH" \
+    --variable "%retcode" \
+    --variable "%lineno" \
+    --expand-variable "trace={{script}}:{{lineno}}" \
+    --expand-json '{"errorType":"return code {{retcode}}","errorMessage":{{message:json}},"stacktrace":[{{trace:json}}]}'
+  return "$retcode"
+}
+
+while true
+do
+  REQUEST_ID_FILE=$(mktemp)
+  EVENT_DATA=$(
+    "${curl[@]}" \
+      --write-out "%output{$REQUEST_ID_FILE}%header{Lambda-Runtime-Aws-Request-Id}" \
+      --expand-url "{{LAMBDA}}/next"
+  )
+  REQUEST_ID=$(cat "$REQUEST_ID_FILE")
+  trap 'bootstrap_catch $? $LINENO' ERR
+
+  STDOUT_LOG=$(mktemp)
+  STDOUT_AND_STDERR_LOG=$(mktemp)
+
+  # Execute the handler function from the script
+  # https://stackoverflow.com/a/49299040
+  {
+    {
+      "$SCRIPT_FN" "$EVENT_DATA" || true
+    } \
+    | tee /dev/stderr \
+    > "$STDOUT_LOG"
+  } 2>&1 \
+  | tee "$STDOUT_AND_STDERR_LOG" \
+
+  if test "${RESP_STATUS:-0}" -lt 400; then
+    RESP_BODY=$STDOUT_LOG
+  else
+    RESP_BODY=$STDOUT_AND_STDERR_LOG
+  fi
+
+  "${curl[@]}" \
+    --expand-url "{{LAMBDA}}/$REQUEST_ID/response" \
+    --request POST \
+    --variable RESP_BODY@"$RESP_BODY" \
+    --variable %RESP_STATUS=200 \
+    --variable %RESP_HEADERS='{}' \
+    --expand-json '{"statusCode":{{RESP_STATUS}},"headers":{{RESP_HEADERS}},"body":{{RESP_BODY:json}}}'
+done
